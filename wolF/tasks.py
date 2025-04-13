@@ -25,33 +25,37 @@ class extract_sam(wolf.Task):
     bam="${gs_clean_bam}"
     bai="${gs_clean_bai}"
 
-    cat ${OncoBed} | \
-        awk '{ print "$7==\\""$1"\\"","&& $8>"$2,"&& $8<="$3}' | \
-        sed -e ':a' -e 'N' -e '$!ba' -e 's/\\n/ || /g' | \
-        cat <(echo -n "{ if (") - | \
-        awk '{print $0" ) { print $0 ;}}"}' > \
-        code_filter_sam_MP_Onco.awk
+    awk 'BEGIN { printf "{ if (" }
+    {
+        printf "($7==\"%s\" && $8>%s && $8<=%s)", $1, $2, $3
+        if (NR < NR+0) printf " || "
+    }
+    END { print ") { print \$0; } }" }' "$OncoBed" > \
+    code_filter_sam_MP_Onco.awk
 
-    cat ${OncoBed} | \
-        awk '{ print "$12==\\""$1"\\"","&& $13>"$2,"&& $13<="$3}' | \
-        sed -e ':a' -e 'N' -e '$!ba' -e 's/\\n/ || /g' | \
-        cat <(echo -n "{ if (") - | \
-        awk '{print $0" ) { print $0 ;}}"}' > \
-        code_filter_sam_SA_Onco.awk
+    awk 'BEGIN { printf "{ if (" }
+    {
+        printf "($12==\"%s\" && $13>%s && $13<=%s)", $1, $2, $3
+        if (NR < NR+0) printf " || "
+    }
+    END { print ") { print \$0; } }" }' "$OncoBed" > \
+    code_filter_sam_SA_Onco.awk
 
-    cat ${IgBed} | \
-        awk '{ print "$7==\\""$1"\\"","&& $8>"$2,"&& $8<="$3}' | \
-        sed -e ':a' -e 'N' -e '$!ba' -e 's/\\n/ || /g' | \
-        cat <(echo -n "{ if (") - | \
-        awk '{print $0" ) { print $0 ;}}"}' > \
-        code_filter_sam_MP_Ig.awk
+    awk 'BEGIN { printf "{ if (" }
+    {
+        printf "($7==\"%s\" && $8>%s && $8<=%s)", $1, $2, $3
+        if (NR < NR+0) printf " || "
+    }
+    END { print ") { print \$0; } }" }' "$IgBed" > \
+    code_filter_sam_MP_Ig.awk
 
-    cat ${IgBed} | \
-        awk '{ print "$12==\\""$1"\\"","&& $13>"$2,"&& $13<="$3}' | \
-        sed -e ':a' -e 'N' -e '$!ba' -e 's/\\n/ || /g' | \
-        cat <(echo -n "{ if (") - | \
-        awk '{print $0" ) { print $0 ;}}"}' > \
-        code_filter_sam_SA_Ig.awk
+    awk 'BEGIN { printf "{ if (" }
+    {
+        printf "($12==\"%s\" && $13>%s && $13<=%s)", $1, $2, $3
+        if (NR < NR+0) printf " || "
+    }
+    END { print ") { print \$0; } }" }' "$IgBed" > \
+    code_filter_sam_SA_Ig.awk
 
     samtools view \
         -q ${min_map_quality_ig} \
