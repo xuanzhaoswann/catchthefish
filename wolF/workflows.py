@@ -6,14 +6,14 @@ from wolf.fc import SyncToWorkspace
 def catchthefish(id,
                  gs_clean_bam,
                  gs_clean_bai,
-                 OncoBed="gs://jba-utils/GRCh38-oncogenes-regions-CoMMPASS-adjusted-BCL.bed",
-                 IgBed="gs://jba-utils/GRCh38-ig-regions-CoMMPASS-adjusted.bed",
-                 min_map_quality_onco=60,
+                 OncoBed="gs://fc-15c5f539-a3ac-4ccd-8a9c-66bdd72cb5ff/catchthefish/ref/hg19_oncogene_regions.bed",
+                 IgBed="gs://fc-15c5f539-a3ac-4ccd-8a9c-66bdd72cb5ff/catchthefish/ref/hg19_ig_regions.bed",
+                 min_map_quality_onco=30,
                  min_map_quality_ig=0,
                  exclude_flag_split=1540,
                  exclude_flag_mate=1548,
                  include_flag_mate=1,
-                 genome="hg38",
+                 genome="hg19",
                  eps=500,
                  minPts=2,
                  add_gs_suffix=False,
@@ -52,7 +52,8 @@ def catchthefish(id,
                 }
         sync_run = SyncToWorkspace(
                 nameworkspace = workspace,
-                entity_type = "pair",
+                #entity_type = "pair",
+                entity_type = "sample",
                 entity_name = id,
                 attr_map = upload_dict
                 )
