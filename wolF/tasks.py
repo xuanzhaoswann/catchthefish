@@ -128,12 +128,22 @@ class cluster_reads(wolf.Task):
         "OncoBed":None,
         "IgBed":None,
         "reads":None,
+        "gs_clean_bam":None,
+        "gs_clean_bai":None,
         "genome":"hg19",
         "eps":500,
-        "minPts":2
+        "minPts":2,
+        "ref_window":1000,
+        "ref_min_mapq":20
     }
+    overrides = {"gs_clean_bam":"string", "gs_clean_bai":"string"}
     script = """
     set -euxo pipefail
+
+    export GCS_OAUTH_TOKEN=$(gcloud auth application-default print-access-token)
+
+    bam="${gs_clean_bam}"
+    bai="${gs_clean_bai}"
 
     Rscript - \
     "${reads}" \
@@ -144,7 +154,11 @@ class cluster_reads(wolf.Task):
     "${minPts}" \
     "${id}_clusters_eps${eps}_minPts${minPts}_raw.txt" \
     "${id}_clusters_eps${eps}_minPts${minPts}_filtered.txt" \
-    "${id}_clusters_eps${eps}_minPts${minPts}.pdf" << "HEREDOC"
+    "${id}_clusters_eps${eps}_minPts${minPts}.pdf" \
+    "${bam}" \
+    "${bai}" \
+    "${ref_window}" \
+    "${ref_min_mapq}" << "HEREDOC"
 
 sem <- function(x) sd(x)/sqrt(length(x))
 
@@ -220,7 +234,40 @@ tx.to.bed2 <- function(x) {
     mutate(PARTNER_CHR=paste0("chr", PARTNER_CHR)) %>%
     dplyr::select(PARTNER_CHR, PARTNER_START, PARTNER_END)
 }
+# ----------------------------------------------------------------------------
+# Reference-read counting + VAF
+# ----------------------------------------------------------------------------
+count.ref.spanning <- function(chr, pos, bam, bai, window, min_mapq) {
+  pos <- as.integer(round(pos))
+  if (is.na(pos) || pos < 1) return(NA_integer_)
 
+  region <- paste0(chr, ":", pos, "-", pos)
+
+  # -f 2   : proper pair only
+  # -F 3852: exclude unmapped+mate-unmapped+secondary+qcfail+dup+supplementary
+  # exclude any read bearing an SA tag (split reads = ALT evidence)
+  awk_prog <- paste0(
+    "function reflen_of(cig,  i,c,num,total){total=0;num=\"\";",
+    "for(i=1;i<=length(cig);i++){c=substr(cig,i,1);",
+    "if(c~/[0-9]/){num=num c}else{",
+    "if(c==\"M\"||c==\"D\"||c==\"N\"||c==\"=\"||c==\"X\")total+=num+0;num=\"\"}}",
+    "return total}",
+    "BEGIN{c=0}",
+    "{ if($0 ~ /\tSA:Z:/) next;",
+    "  start=$4; end=start+reflen_of($6)-1;",
+    "  if(start<BP && end>BP) c++ }",
+    "END{print c}"
+  )
+  cmd <- paste(
+    "samtools view -f 2 -F 3852 -q", min_mapq,
+    "-X", shQuote(bam), shQuote(bai), shQuote(region),
+    "| awk -v BP=", pos, shQuote(awk_prog)
+  )
+  out <- tryCatch(system(cmd, intern = TRUE), error = function(e) NA_character_)
+  val <- suppressWarnings(as.integer(out[length(out)]))
+  if (length(val) == 0 || is.na(val)) return(NA_integer_)
+  val
+}
 # This script takes potential reads from CatchTheFISH,
 # pairs reads, and cluster them, to call translocations
 
@@ -249,6 +296,12 @@ clustered.tx <- args[7]
 clustered.tx.filtered <- args[8]
 circos.plot <- args[9]
 
+# REF / VAF
+bam <- as.character(args[10])
+bai <- as.character(args[11])
+ref.window <- as.numeric(args[12])
+ref.min.mapq <- as.numeric(args[13])
+
 # Parse input files -------------------------------------------------------
 
 tx.header <- c("ID","SVTYPE","READNAME","FLAG","CHR1","POS1","QUAL","CIGAR","CHRB","POSB","TLEN","SEQ","SEQQUAL")
@@ -257,7 +310,7 @@ tx <- read.delim(reads, col.names = tx.header, colClasses = tx.col.classes, head
 
 if( nrow(tx ) < 2 ) {
   # first, in case there is no abnormal read called / potential translocation
-  res.colnames <- c("ID","Chr_Cluster","IG","ONCO","CHR.IG","IG_START","IG_END","CHR.ONCO","PARTNER_START","PARTNER_END","INTERVAL_LENGTH","IG_LENGTH","reads","maxMAPQ.ONCO","maxMAPQ.IG","N_Matches","N_Molecules","N_Mate_Pairs","N_Split_Reads","Breakpoint")
+  res.colnames <- c("ID","Chr_Cluster","IG","ONCO","CHR.IG","IG_START","IG_END","CHR.ONCO","PARTNER_START","PARTNER_END","INTERVAL_LENGTH","IG_LENGTH","reads","maxMAPQ.ONCO","maxMAPQ.IG","N_Matches","N_Molecules","N_Mate_Pairs","N_Split_Reads","Breakpoint","BP.ONCO","BP.IG","BP_PRECISE","ALT","REF.ONCO","REF.IG","VAF.ONCO","VAF.IG","VAF.MEAN")
   res <- setNames(data.frame(matrix(ncol = length(res.colnames), nrow = 0)), res.colnames)
   pdf(circos.plot, paper = "a4")
   circos.clear()
@@ -331,9 +384,38 @@ if( nrow(tx ) < 2 ) {
               N_Molecules=length(unique(READNAME)),
               N_Mate_Pairs=sum(SVTYPE=="Paired-Read"),
               N_Split_Reads=sum(SVTYPE=="Split-Read"),
+              SA_ONCO=ifelse(any(SVTYPE=="Split-Read"),
+                             median(POS.ONCO[SVTYPE=="Split-Read"]), NA_real_),
+              SA_IG=ifelse(any(SVTYPE=="Split-Read"),
+                           median(POS.IG[SVTYPE=="Split-Read"]), NA_real_),
               Breakpoint=paste0("Breakpoint_", first(Cluster))) %>%
     ungroup()
+# Breakpoint assignment: SA-precise if a split read exists, else span midpoint
+  res1 <- res1 %>%
+    mutate(
+      BP_PRECISE = ifelse(N_Split_Reads > 0, "PRECISE", "IMPRECISE"),
+      BP.ONCO = ifelse(N_Split_Reads > 0, round(SA_ONCO),
+                       round((PARTNER_START + PARTNER_END)/2)),
+      BP.IG   = ifelse(N_Split_Reads > 0, round(SA_IG),
+                       round((IG_START + IG_END)/2))
+    )
 
+  # Reference-read counting + VAF (per cluster, both sides)
+  if (nrow(res1) >= 1) {
+    res1 <- res1 %>%
+      rowwise() %>%
+      mutate(
+        ALT      = N_Molecules,
+        REF.ONCO = count.ref.spanning(CHR.ONCO, BP.ONCO, bam, bai, ref.window, ref.min.mapq),
+        REF.IG   = count.ref.spanning(CHR.IG,   BP.IG,   bam, bai, ref.window, ref.min.mapq),
+        VAF.ONCO = ifelse(is.na(REF.ONCO), NA_real_, ALT / (ALT + REF.ONCO)),
+        VAF.IG   = ifelse(is.na(REF.IG),   NA_real_, ALT / (ALT + REF.IG)),
+        VAF.MEAN = rowMeans(cbind(VAF.ONCO, VAF.IG), na.rm = TRUE)
+      ) %>%
+      ungroup() %>%
+      mutate(VAF.MEAN = ifelse(is.nan(VAF.MEAN), NA_real_, VAF.MEAN))
+  }
+  
   # Further filtering -------------------------------------------------------
 
   res <- res1 %>%

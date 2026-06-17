@@ -38,6 +38,8 @@ def catchthefish(id,
         "OncoBed":OncoBed,
         "IgBed":IgBed,
         "reads":bam_in_the_cloud["pseudo_sam"],
+        "gs_clean_bam":gs_clean_bam,
+        "gs_clean_bai":gs_clean_bai,
         "genome":genome,
         "eps":eps,
         "minPts":minPts
