@@ -247,16 +247,16 @@ count.ref.spanning <- function(chr, pos, bam, bai, window, min_mapq) {
   # -F 3852: exclude unmapped+mate-unmapped+secondary+qcfail+dup+supplementary
   # exclude any read bearing an SA tag (split reads = ALT evidence)
   awk_prog <- paste0(
-    "function reflen_of(cig,  i,c,num,total){total=0;num=\"\";",
-    "for(i=1;i<=length(cig);i++){c=substr(cig,i,1);",
-    "if(c~/[0-9]/){num=num c}else{",
-    "if(c==\"M\"||c==\"D\"||c==\"N\"||c==\"=\"||c==\"X\")total+=num+0;num=\"\"}}",
-    "return total}",
-    "BEGIN{c=0}",
-    "{ if($0 ~ /\tSA:Z:/) next;",
-    "  start=$4; end=start+reflen_of($6)-1;",
-    "  if(start<BP && end>BP) c++ }",
-    "END{print c}"
+    'function reflen_of(cig,  i,c,num,total){total=0;num="";',
+    'for(i=1;i<=length(cig);i++){c=substr(cig,i,1);',
+    'if(c~/[0-9]/){num=num c}else{',
+    'if(c=="M"||c=="D"||c=="N"||c=="="||c=="X")total+=num+0;num=""}}',
+    'return total}',
+    'BEGIN{c=0}',
+    '{ if($0 ~ /\tSA:Z:/) next;',
+    '  start=$4; end=start+reflen_of($6)-1;',
+    '  if(start<BP && end>BP) c++ }',
+    'END{print c}'
   )
   cmd <- paste(
     "samtools view -f 2 -F 3852 -q", min_mapq,
