@@ -451,7 +451,9 @@ BEGIN{ c=0 }
       if(is_alt==1) break;
     }
   }
-  if(is_alt==1) c++;
+  # dedupe by read name: count each supporting molecule once, even if it
+  # appears as both a primary and a supplementary row at this locus.
+  if(is_alt==1 && !($1 in seen)){ seen[$1]=1; c++ }
 }
 END{ print c }
 AWK
@@ -474,11 +476,11 @@ AWK
         REF=${REF:-0}
 
         # ALT: split + discordant-mate reads at this breakpoint pointing at the
-        # PARTNER breakpoint window. Note: NOT -f 2 (discordant reads are not in
-        # a proper pair) and NOT -F supplementary-excluded entirely, but we keep
-        # the same mapq floor and exclude unmapped/dup/secondary via -F 3340
-        # (4+8+256+1024+2048 = 3340; we DO allow non-proper-pair here).
-        ALT=$(samtools view -F 3340 -q ${minq} \
+        # PARTNER breakpoint window. We must NOT exclude supplementary (2048)
+        # alignments -- the supplementary half of a split read IS ALT evidence.
+        # -F 1292 excludes unmapped(4)+mate-unmapped(8)+secondary(256)+dup(1024)
+        # (1292 = 4+8+256+1024); keeps supplementary and non-proper-pair reads.
+        ALT=$(samtools view -F 1292 -q ${minq} \
                 -X ${bam} ${bai} "${region}" \
                 | awk -v PCHR=${PCHR} -v PBP=${PBP} -v W=${altwin} -f count_alt.awk)
         ALT=${ALT:-0}
