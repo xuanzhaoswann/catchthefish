@@ -199,7 +199,7 @@ circos.plot <- args[9]
 breakpoints.out <- args[10]
 
 # breakpoints file always gets written (even empty) so the next task has input
-bp.colnames <- c("ID","Chr_Cluster","SIDE","CHR","BP","ALT")
+bp.colnames <- c("ID","Chr_Cluster","SIDE","CHR","BP","PARTNER_CHR","PARTNER_BP","N_Molecules")
 write.table(setNames(data.frame(matrix(ncol=length(bp.colnames), nrow=0)), bp.colnames),
             breakpoints.out, row.names = FALSE, quote = FALSE, sep = "\t")
 
@@ -303,10 +303,21 @@ if( nrow(tx ) < 2 ) {
       filter(MAPQ.ONCO>=55 & INTERVAL_LENGTH>=1 & IG_LENGTH>=1)
 
   # Write breakpoints file (long format: one row per side per cluster) -------
+  # Each row carries this side's CHR/BP AND the PARTNER side's CHR/BP, so the
+  # downstream count_ref task can test whether a read's SA tag / discordant mate
+  # points at the partner breakpoint (= ALT evidence for THIS junction).
+  # N_Molecules is retained for comparison against the recounted ALT.
   if (nrow(res1) >= 1) {
-    bp.onco <- res1 %>% transmute(ID, Chr_Cluster, SIDE="ONCO", CHR=CHR.ONCO, BP=BP.ONCO, ALT=ALT)
-    bp.ig   <- res1 %>% transmute(ID, Chr_Cluster, SIDE="IG",   CHR=CHR.IG,   BP=BP.IG,   ALT=ALT)
-    bp.all  <- bind_rows(bp.onco, bp.ig) %>% filter(!is.na(BP) & BP >= 1)
+    bp.onco <- res1 %>% transmute(ID, Chr_Cluster, SIDE="ONCO",
+                                  CHR=CHR.ONCO, BP=BP.ONCO,
+                                  PARTNER_CHR=CHR.IG, PARTNER_BP=BP.IG,
+                                  N_Molecules=N_Molecules)
+    bp.ig   <- res1 %>% transmute(ID, Chr_Cluster, SIDE="IG",
+                                  CHR=CHR.IG, BP=BP.IG,
+                                  PARTNER_CHR=CHR.ONCO, PARTNER_BP=BP.ONCO,
+                                  N_Molecules=N_Molecules)
+    bp.all  <- bind_rows(bp.onco, bp.ig) %>%
+      filter(!is.na(BP) & BP >= 1 & !is.na(PARTNER_BP) & PARTNER_BP >= 1)
     write.table(bp.all, breakpoints.out, row.names = FALSE, quote = FALSE, sep = "\t")
   }
 
@@ -376,7 +387,8 @@ class count_ref(wolf.Task):
         "breakpoints":None,
         "gs_clean_bam":None,
         "gs_clean_bai":None,
-        "ref_min_mapq":30
+        "ref_min_mapq":30,
+        "alt_window":1000
     }
     overrides = {"gs_clean_bam":"string", "gs_clean_bai":"string"}
     script = """
@@ -388,10 +400,11 @@ class count_ref(wolf.Task):
     bai="${gs_clean_bai}"
     bp="${breakpoints}"
     minq="${ref_min_mapq}"
+    altwin="${alt_window}"
 
-    # awk program that counts concordant, breakpoint-spanning reads.
-    # Reads SAM on stdin; BP passed via -v. Drops SA-tagged (split) reads;
-    # computes reference span from CIGAR; counts reads strictly spanning BP.
+    # ---- REF awk: concordant reads that strongly span the breakpoint ----
+    # Drops SA-tagged (split) reads; counts reads whose CIGAR-implied span
+    # strictly crosses BP. This is the REF (reference-allele) evidence.
     cat > count_span.awk << 'AWK'
 function reflen_of(cig,  i,c,num,total){
   total=0; num="";
@@ -411,28 +424,70 @@ BEGIN{ c=0 }
 END{ print c }
 AWK
 
-    # Output header (printf is portable; echo -e prints literal -e under dash/sh)
-    printf 'ID\tChr_Cluster\tSIDE\tCHR\tBP\tALT\tREF\tVAF\n' > "${id}_vaf.txt"
+    # ---- ALT awk: reads supporting the translocation (variant allele) ----
+    # Passed via -v: PCHR (partner chr), PBP (partner breakpoint), W (window).
+    # A read is ALT if EITHER:
+    #   (a) split  : has SA:Z: tag whose target chr==PCHR & pos in [PBP-W,PBP+W]
+    #   (b) discord: RNEXT==PCHR & PNEXT in [PBP-W,PBP+W]  (mate at partner)
+    cat > count_alt.awk << 'AWK'
+function inwin(p){ return (p >= PBP-W && p <= PBP+W) }
+BEGIN{ c=0 }
+{
+  rnext=$7; pnext=$8; is_alt=0;
+  # (b) discordant mate pointing into the partner window
+  if(rnext==PCHR && inwin(pnext+0)) is_alt=1;
+  # (a) split read: parse SA tag if present
+  if(is_alt==0){
+    for(i=12;i<=NF;i++){
+      if($i ~ /^SA:Z:/){
+        sa=$i; sub(/^SA:Z:/,"",sa);
+        n=split(sa, arr, ";");
+        for(j=1;j<=n;j++){
+          if(length(arr[j])==0) continue;
+          m=split(arr[j], f, ",");
+          if(m>=2 && f[1]==PCHR && inwin(f[2]+0)){ is_alt=1; break }
+        }
+      }
+      if(is_alt==1) break;
+    }
+  }
+  if(is_alt==1) c++;
+}
+END{ print c }
+AWK
 
-    # Skip the header line of the breakpoints file, then loop rows.
-    # Columns: ID  Chr_Cluster  SIDE  CHR  BP  ALT
-    tail -n +2 "${bp}" | while IFS=$'\t' read -r BID CLUST SIDE CHR BP ALT; do
-        # guard against blank lines
+    # Output header. ALT = recounted at breakpoint (split + discordant mate).
+    # N_Molecules = original CatchTheFISH detection count, retained for compare.
+    printf 'ID\tChr_Cluster\tSIDE\tCHR\tBP\tPARTNER_CHR\tPARTNER_BP\tN_Molecules\tALT\tREF\tVAF\n' > "${id}_vaf.txt"
+
+    # Breakpoints columns: ID Chr_Cluster SIDE CHR BP PARTNER_CHR PARTNER_BP N_Molecules
+    tail -n +2 "${bp}" | while IFS=$'\t' read -r BID CLUST SIDE CHR BP PCHR PBP NMOL; do
         [ -z "${BP:-}" ] && continue
+        [ -z "${PBP:-}" ] && continue
 
         region="${CHR}:${BP}-${BP}"
 
+        # REF: clean spanning reads at this breakpoint, mapq >= minq
         REF=$(samtools view -f 2 -F 3852 -q ${minq} \
                 -X ${bam} ${bai} "${region}" \
                 | awk -v BP=${BP} -f count_span.awk)
-
-        # default REF to 0 if samtools returned nothing
         REF=${REF:-0}
 
-        # VAF = ALT / (ALT + REF), computed in awk for float math
+        # ALT: split + discordant-mate reads at this breakpoint pointing at the
+        # PARTNER breakpoint window. Note: NOT -f 2 (discordant reads are not in
+        # a proper pair) and NOT -F supplementary-excluded entirely, but we keep
+        # the same mapq floor and exclude unmapped/dup/secondary via -F 3340
+        # (4+8+256+1024+2048 = 3340; we DO allow non-proper-pair here).
+        ALT=$(samtools view -F 3340 -q ${minq} \
+                -X ${bam} ${bai} "${region}" \
+                | awk -v PCHR=${PCHR} -v PBP=${PBP} -v W=${altwin} -f count_alt.awk)
+        ALT=${ALT:-0}
+
+        # VAF = ALT / (ALT + REF), symmetric counts at one stringency
         VAF=$(awk -v a="${ALT}" -v r="${REF}" 'BEGIN{ d=a+r; if(d>0) printf "%.6f", a/d; else print "NA" }')
 
-        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "${BID}" "${CLUST}" "${SIDE}" "${CHR}" "${BP}" "${ALT}" "${REF}" "${VAF}" >> "${id}_vaf.txt"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "${BID}" "${CLUST}" "${SIDE}" "${CHR}" "${BP}" "${PCHR}" "${PBP}" "${NMOL}" "${ALT}" "${REF}" "${VAF}" >> "${id}_vaf.txt"
     done
     """
     outputs = {
