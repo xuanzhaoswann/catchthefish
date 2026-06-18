@@ -38,11 +38,16 @@ def catchthefish(id,
         "OncoBed":OncoBed,
         "IgBed":IgBed,
         "reads":bam_in_the_cloud["pseudo_sam"],
-        "gs_clean_bam":gs_clean_bam,
-        "gs_clean_bai":gs_clean_bai,
         "genome":genome,
         "eps":eps,
         "minPts":minPts
+    })
+
+    vaf = count_ref(inputs = {
+        "id":id,
+        "breakpoints":tx["breakpoints"],
+        "gs_clean_bam":gs_clean_bam,
+        "gs_clean_bai":gs_clean_bai
     })
 
     if workspace:
@@ -51,6 +56,7 @@ def catchthefish(id,
                 'clusters_tx_filtered':tx["clusters_tx_filtered"],
                 'clusters_candidate_bam':bam_in_the_cloud["potential_reads_bam"],
                 'clusters_candidate_bai':bam_in_the_cloud["potential_reads_bai"],
+                'clusters_vaf':vaf["vaf"],
                 }
         sync_run = SyncToWorkspace(
                 nameworkspace = workspace,

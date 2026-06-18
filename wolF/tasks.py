@@ -25,7 +25,7 @@ class extract_sam(wolf.Task):
     bam="${gs_clean_bam}"
     bai="${gs_clean_bai}"
 
-   cat ${OncoBed} | \
+    cat ${OncoBed} | \
         awk '{ print "$7==\\""$1"\\"","&& $8>"$2,"&& $8<="$3}' | \
         sed -e ':a' -e 'N' -e '$!ba' -e 's/\\n/ || /g' | \
         cat <(echo -n "{ if (") - | \
@@ -121,6 +121,10 @@ class extract_sam(wolf.Task):
     docker = "jbalberge/samtools_cloud:1.13"
 
 
+# ============================================================================
+# STEP A: cluster_reads  (R container) -- clusters, finds breakpoints, ALT.
+#   No REF counting here. Writes a breakpoints file for the samtools step.
+# ============================================================================
 class cluster_reads(wolf.Task):
     name = "cluster_reads"
     inputs = {
@@ -128,22 +132,12 @@ class cluster_reads(wolf.Task):
         "OncoBed":None,
         "IgBed":None,
         "reads":None,
-        "gs_clean_bam":None,
-        "gs_clean_bai":None,
         "genome":"hg19",
         "eps":500,
-        "minPts":2,
-        "ref_window":1000,
-        "ref_min_mapq":20
+        "minPts":2
     }
-    overrides = {"gs_clean_bam":"string", "gs_clean_bai":"string"}
     script = """
     set -euxo pipefail
-
-    export GCS_OAUTH_TOKEN=$(gcloud auth application-default print-access-token)
-
-    bam="${gs_clean_bam}"
-    bai="${gs_clean_bai}"
 
     Rscript - \
     "${reads}" \
@@ -155,10 +149,7 @@ class cluster_reads(wolf.Task):
     "${id}_clusters_eps${eps}_minPts${minPts}_raw.txt" \
     "${id}_clusters_eps${eps}_minPts${minPts}_filtered.txt" \
     "${id}_clusters_eps${eps}_minPts${minPts}.pdf" \
-    "${bam}" \
-    "${bai}" \
-    "${ref_window}" \
-    "${ref_min_mapq}" << "HEREDOC"
+    "${id}_breakpoints.txt" << "HEREDOC"
 
 sem <- function(x) sd(x)/sqrt(length(x))
 
@@ -171,7 +162,6 @@ annotate.position <- function(hit.chr, hit.pos, bed) {
   }
 }
 
-
 run.dbscan <- function(df, eps=1000, min.pts=2){
   mat <- df %>% select(POS.IG, POS.ONCO) %>% as.matrix()
   res <- dbscan(mat, eps, minPts = min.pts, weights = NULL, borderPoints = TRUE)
@@ -179,95 +169,6 @@ run.dbscan <- function(df, eps=1000, min.pts=2){
   df
 }
 
-
-
-extract.tx.from.delly <- function(delly.output,
-                                  ig_chr="14",
-                                  ig_start=105586000,
-                                  ig_end=106880000,
-                                  chromosomes=c(1:22, "X", "Y")) {
-  delly.output %>%
-    filter(SVTYPE=="TRA") %>%
-    filter( ( CHROM==ig_chr & POS >= ig_start & POS <= ig_end ) | ( CHR2 == ig_chr & ENDPOSSV >= ig_start & ENDPOSSV <= ig_end )) %>%
-    mutate(PARTNER_CHR = ifelse(CHROM==ig_chr, CHR2, CHROM),
-           PARTNER_POS = ifelse(CHROM==ig_chr, ENDPOSSV, POS),
-           IG_CHR = ig_chr,
-           IG_POS = ifelse(CHROM==ig_chr, POS, ENDPOSSV)) %>%
-    filter(CHR2 %in% chromosomes & CHROM %in% chromosomes) %>%
-    rowwise() %>%
-    mutate(VAF=if(PRECISE=="true") TUMOR_RV / ( TUMOR_RV + TUMOR_RR ) else ( TUMOR_DV / ( TUMOR_DV + TUMOR_DR )) )
-}
-
-
-cluster.tx <- function(tx, eps=2E5, minPts=3, min_noise_partner=1000, min_ig_partner=1000) {
-  tx %>%
-    group_by(IG_CHR, PARTNER_CHR) %>%
-    group_modify(~ {
-      distances <-  dist(matrix(c(.x$PARTNER_POS, .x$IG_POS), ncol=2, byrow = FALSE), method = "maximum");
-      .x %>% mutate(Cluster = dbscan(distances, eps=eps, minPts=minPts)$cluster)}) %>%
-    mutate(Chr_Cluster=paste0(IG_CHR, "-", PARTNER_CHR, "_", Cluster)) %>%
-    filter(Cluster!=0) %>%
-    group_by(Chr_Cluster, IG_CHR, PARTNER_CHR) %>%
-    summarise(COUNT_CLUSTERED_TX=n(),
-              IG_START=min(IG_POS),
-              IG_END=max(IG_POS),
-              PARTNER_START=min(PARTNER_POS),
-              PARTNER_END=max(PARTNER_POS),
-              INTERVAL_LENGTH=PARTNER_END-PARTNER_START,
-              IG_LENGTH=IG_END-IG_START,
-              patients=paste(Specimen_ID, collapse = ", "),
-              mMAPQ=median(MAPQ),
-              mPE=median(as.numeric(PE), na.rm = TRUE),
-              mSR=median(as.numeric(SR), na.rm = TRUE),
-              mVAF=median(VAF), na.rm = TRUE) %>%
-    filter(INTERVAL_LENGTH > min_noise_partner & IG_LENGTH >= min_ig_partner) %>%
-    ungroup()
-}
-
-tx.to.bed1 <- function(x) {
-  x %>%
-    mutate(IG_CHR=paste0("chr", IG_CHR)) %>%
-    dplyr::select(IG_CHR, IG_START, IG_END)
-}
-tx.to.bed2 <- function(x) {
-  x %>%
-    mutate(PARTNER_CHR=paste0("chr", PARTNER_CHR)) %>%
-    dplyr::select(PARTNER_CHR, PARTNER_START, PARTNER_END)
-}
-# ----------------------------------------------------------------------------
-# Reference-read counting + VAF
-# ----------------------------------------------------------------------------
-count.ref.spanning <- function(chr, pos, bam, bai, window, min_mapq) {
-  pos <- as.integer(round(pos))
-  if (is.na(pos) || pos < 1) return(NA_integer_)
-
-  region <- paste0(chr, ":", pos, "-", pos)
-
-  # -f 2   : proper pair only
-  # -F 3852: exclude unmapped+mate-unmapped+secondary+qcfail+dup+supplementary
-  # exclude any read bearing an SA tag (split reads = ALT evidence)
-  awk_prog <- paste0(
-    'function reflen_of(cig,  i,c,num,total){total=0;num="";',
-    'for(i=1;i<=length(cig);i++){c=substr(cig,i,1);',
-    'if(c~/[0-9]/){num=num c}else{',
-    'if(c=="M"||c=="D"||c=="N"||c=="="||c=="X")total+=num+0;num=""}}',
-    'return total}',
-    'BEGIN{c=0}',
-    '{ if($0 ~ /\tSA:Z:/) next;',
-    '  start=$4; end=start+reflen_of($6)-1;',
-    '  if(start<BP && end>BP) c++ }',
-    'END{print c}'
-  )
-  cmd <- paste(
-    "samtools view -f 2 -F 3852 -q", min_mapq,
-    "-X", shQuote(bam), shQuote(bai), shQuote(region),
-    "| awk -v BP=", pos, shQuote(awk_prog)
-  )
-  out <- tryCatch(system(cmd, intern = TRUE), error = function(e) NA_character_)
-  val <- suppressWarnings(as.integer(out[length(out)]))
-  if (length(val) == 0 || is.na(val)) return(NA_integer_)
-  val
-}
 # This script takes potential reads from CatchTheFISH,
 # pairs reads, and cluster them, to call translocations
 
@@ -295,12 +196,12 @@ minPts <- as.numeric(args[6])
 clustered.tx <- args[7]
 clustered.tx.filtered <- args[8]
 circos.plot <- args[9]
+breakpoints.out <- args[10]
 
-# REF / VAF
-bam <- as.character(args[10])
-bai <- as.character(args[11])
-ref.window <- as.numeric(args[12])
-ref.min.mapq <- as.numeric(args[13])
+# breakpoints file always gets written (even empty) so the next task has input
+bp.colnames <- c("ID","Chr_Cluster","SIDE","CHR","BP","ALT")
+write.table(setNames(data.frame(matrix(ncol=length(bp.colnames), nrow=0)), bp.colnames),
+            breakpoints.out, row.names = FALSE, quote = FALSE, sep = "\t")
 
 # Parse input files -------------------------------------------------------
 
@@ -309,8 +210,7 @@ tx.col.classes <- c("character", "character", "character", "numeric", "character
 tx <- read.delim(reads, col.names = tx.header, colClasses = tx.col.classes, header = TRUE)
 
 if( nrow(tx ) < 2 ) {
-  # first, in case there is no abnormal read called / potential translocation
-  res.colnames <- c("ID","Chr_Cluster","IG","ONCO","CHR.IG","IG_START","IG_END","CHR.ONCO","PARTNER_START","PARTNER_END","INTERVAL_LENGTH","IG_LENGTH","reads","maxMAPQ.ONCO","maxMAPQ.IG","N_Matches","N_Molecules","N_Mate_Pairs","N_Split_Reads","Breakpoint","BP.ONCO","BP.IG","BP_PRECISE","ALT","REF.ONCO","REF.IG","VAF.ONCO","VAF.IG","VAF.MEAN")
+  res.colnames <- c("ID","Chr_Cluster","IG","ONCO","CHR.IG","IG_START","IG_END","CHR.ONCO","PARTNER_START","PARTNER_END","INTERVAL_LENGTH","IG_LENGTH","reads","maxMAPQ.ONCO","maxMAPQ.IG","N_Matches","N_Molecules","N_Mate_Pairs","N_Split_Reads","Breakpoint","BP.ONCO","BP.IG","BP_PRECISE","ALT")
   res <- setNames(data.frame(matrix(ncol = length(res.colnames), nrow = 0)), res.colnames)
   pdf(circos.plot, paper = "a4")
   circos.clear()
@@ -330,7 +230,6 @@ if( nrow(tx ) < 2 ) {
            ONCO=annotate.position(hit.chr = CHR1, hit.pos = POS1, bed = onco.bed)) %>%
     group_by(ID, SVTYPE, READNAME) %>%
     filter(n()>=2)
-  # if read name appears only once, it could be that mate was annotated invalid by vendor
 
   tx.ig <- tx.2 %>%
     filter(IG!="") %>%
@@ -340,8 +239,6 @@ if( nrow(tx ) < 2 ) {
     filter(ONCO!="") %>%
     transmute(ID, SVTYPE, READNAME, CHR.ONCO=CHR1, POS.ONCO=POS1, ONCO, QUAL.ONCO=QUAL)
 
-  # should be only one row per read / SVTYPE / patient
-  # QUAL ONCO is more important than IG (we want to be very stringent on oncogenic partner, while IG is ~~~)
   tx.join <- inner_join(tx.ig, tx.onco, by=c("ID", "SVTYPE", "READNAME")) %>%
     group_by(ID, SVTYPE, READNAME) %>%
     slice_max(n = 1, order_by = QUAL.ONCO, with_ties = FALSE)
@@ -390,36 +287,28 @@ if( nrow(tx ) < 2 ) {
                            median(POS.IG[SVTYPE=="Split-Read"]), NA_real_),
               Breakpoint=paste0("Breakpoint_", first(Cluster))) %>%
     ungroup()
-# Breakpoint assignment: SA-precise if a split read exists, else span midpoint
+
+  # Breakpoint assignment: SA-precise if a split read exists, else span midpoint
   res1 <- res1 %>%
     mutate(
       BP_PRECISE = ifelse(N_Split_Reads > 0, "PRECISE", "IMPRECISE"),
       BP.ONCO = ifelse(N_Split_Reads > 0, round(SA_ONCO),
                        round((PARTNER_START + PARTNER_END)/2)),
       BP.IG   = ifelse(N_Split_Reads > 0, round(SA_IG),
-                       round((IG_START + IG_END)/2))
+                       round((IG_START + IG_END)/2)),
+      ALT = N_Molecules
     )
-
-  # Reference-read counting + VAF (per cluster, both sides)
-  if (nrow(res1) >= 1) {
-    res1 <- res1 %>%
-      rowwise() %>%
-      mutate(
-        ALT      = N_Molecules,
-        REF.ONCO = count.ref.spanning(CHR.ONCO, BP.ONCO, bam, bai, ref.window, ref.min.mapq),
-        REF.IG   = count.ref.spanning(CHR.IG,   BP.IG,   bam, bai, ref.window, ref.min.mapq),
-        VAF.ONCO = ifelse(is.na(REF.ONCO), NA_real_, ALT / (ALT + REF.ONCO)),
-        VAF.IG   = ifelse(is.na(REF.IG),   NA_real_, ALT / (ALT + REF.IG)),
-        VAF.MEAN = rowMeans(cbind(VAF.ONCO, VAF.IG), na.rm = TRUE)
-      ) %>%
-      ungroup() %>%
-      mutate(VAF.MEAN = ifelse(is.nan(VAF.MEAN), NA_real_, VAF.MEAN))
-  }
-  
-  # Further filtering -------------------------------------------------------
 
   res <- res1 %>%
       filter(MAPQ.ONCO>=55 & INTERVAL_LENGTH>=1 & IG_LENGTH>=1)
+
+  # Write breakpoints file (long format: one row per side per cluster) -------
+  if (nrow(res1) >= 1) {
+    bp.onco <- res1 %>% transmute(ID, Chr_Cluster, SIDE="ONCO", CHR=CHR.ONCO, BP=BP.ONCO, ALT=ALT)
+    bp.ig   <- res1 %>% transmute(ID, Chr_Cluster, SIDE="IG",   CHR=CHR.IG,   BP=BP.IG,   ALT=ALT)
+    bp.all  <- bind_rows(bp.onco, bp.ig) %>% filter(!is.na(BP) & BP >= 1)
+    write.table(bp.all, breakpoints.out, row.names = FALSE, quote = FALSE, sep = "\t")
+  }
 
   # Circos plot -------------------------------------------------------------
 
@@ -458,7 +347,6 @@ if( nrow(tx ) < 2 ) {
   dev.off()
 }
 
-
 # Write output ------------------------------------------------------------
 
 write.table(res, clustered.tx.filtered, row.names = FALSE, quote = TRUE, sep = "\t")
@@ -470,8 +358,84 @@ HEREDOC
     outputs = {
         "clusters_tx" : "*_raw.txt",
         "clusters_tx_filtered" : "*_filtered.txt",
-        "circos_tx" : "*.pdf"
+        "circos_tx" : "*.pdf",
+        "breakpoints" : "*_breakpoints.txt"
     }
     docker = "jbalberge/r-dbscan:latest"
 
 
+# ============================================================================
+# STEP B: count_ref  (samtools container) -- counts REF-spanning reads at each
+#   breakpoint from the ORIGINAL bam, then computes VAF = ALT/(ALT+REF).
+#   Runs on the same image as extract_sam, which has gcloud + samtools.
+# ============================================================================
+class count_ref(wolf.Task):
+    name = "count_ref"
+    inputs = {
+        "id":None,
+        "breakpoints":None,
+        "gs_clean_bam":None,
+        "gs_clean_bai":None,
+        "ref_min_mapq":20
+    }
+    overrides = {"gs_clean_bam":"string", "gs_clean_bai":"string"}
+    script = """
+    set -euxo pipefail
+
+    export GCS_OAUTH_TOKEN=$(gcloud auth application-default print-access-token)
+
+    bam="${gs_clean_bam}"
+    bai="${gs_clean_bai}"
+    bp="${breakpoints}"
+    minq="${ref_min_mapq}"
+
+    # awk program that counts concordant, breakpoint-spanning reads.
+    # Reads SAM on stdin; BP passed via -v. Drops SA-tagged (split) reads;
+    # computes reference span from CIGAR; counts reads strictly spanning BP.
+    cat > count_span.awk << 'AWK'
+function reflen_of(cig,  i,c,num,total){
+  total=0; num="";
+  for(i=1;i<=length(cig);i++){
+    c=substr(cig,i,1);
+    if(c ~ /[0-9]/){ num=num c }
+    else { if(c=="M"||c=="D"||c=="N"||c=="="||c=="X") total+=num+0; num="" }
+  }
+  return total
+}
+BEGIN{ c=0 }
+{
+  if($0 ~ /\tSA:Z:/) next;
+  start=$4; end=start+reflen_of($6)-1;
+  if(start < BP && end > BP) c++
+}
+END{ print c }
+AWK
+
+    # Output header (printf is portable; echo -e prints literal -e under dash/sh)
+    printf 'ID\tChr_Cluster\tSIDE\tCHR\tBP\tALT\tREF\tVAF\n' > "${id}_vaf.txt"
+
+    # Skip the header line of the breakpoints file, then loop rows.
+    # Columns: ID  Chr_Cluster  SIDE  CHR  BP  ALT
+    tail -n +2 "${bp}" | while IFS=$'\t' read -r BID CLUST SIDE CHR BP ALT; do
+        # guard against blank lines
+        [ -z "${BP:-}" ] && continue
+
+        region="${CHR}:${BP}-${BP}"
+
+        REF=$(samtools view -f 2 -F 3852 -q ${minq} \
+                -X ${bam} ${bai} "${region}" \
+                | awk -v BP=${BP} -f count_span.awk)
+
+        # default REF to 0 if samtools returned nothing
+        REF=${REF:-0}
+
+        # VAF = ALT / (ALT + REF), computed in awk for float math
+        VAF=$(awk -v a="${ALT}" -v r="${REF}" 'BEGIN{ d=a+r; if(d>0) printf "%.6f", a/d; else print "NA" }')
+
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "${BID}" "${CLUST}" "${SIDE}" "${CHR}" "${BP}" "${ALT}" "${REF}" "${VAF}" >> "${id}_vaf.txt"
+    done
+    """
+    outputs = {
+        "vaf" : "*_vaf.txt"
+    }
+    docker = "jbalberge/samtools_cloud:1.13"
