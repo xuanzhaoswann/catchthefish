@@ -376,7 +376,7 @@ class count_ref(wolf.Task):
         "breakpoints":None,
         "gs_clean_bam":None,
         "gs_clean_bai":None,
-        "ref_min_mapq":20
+        "ref_min_mapq":30
     }
     overrides = {"gs_clean_bam":"string", "gs_clean_bai":"string"}
     script = """
