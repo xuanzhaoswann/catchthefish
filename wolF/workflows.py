@@ -57,6 +57,7 @@ def catchthefish(id,
                 'clusters_candidate_bam':bam_in_the_cloud["potential_reads_bam"],
                 'clusters_candidate_bai':bam_in_the_cloud["potential_reads_bai"],
                 'clusters_vaf':vaf["vaf"],
+                'clusters_vaf_byside':vaf["vaf_byside"],
                 }
         sync_run = SyncToWorkspace(
                 nameworkspace = workspace,
