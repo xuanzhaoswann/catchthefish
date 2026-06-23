@@ -387,8 +387,7 @@ class count_ref(wolf.Task):
         "breakpoints":None,
         "gs_clean_bam":None,
         "gs_clean_bai":None,
-        "ref_min_mapq":30,
-        "alt_window":1000
+        "ref_min_mapq":30
     }
     overrides = {"gs_clean_bam":"string", "gs_clean_bai":"string"}
     script = """
@@ -400,7 +399,6 @@ class count_ref(wolf.Task):
     bai="${gs_clean_bai}"
     bp="${breakpoints}"
     minq="${ref_min_mapq}"
-    altwin="${alt_window}"
 
     # ---- REF awk: concordant reads that strongly span the breakpoint ----
     # Drops SA-tagged (split) reads; counts reads whose CIGAR-implied span
@@ -424,48 +422,15 @@ BEGIN{ c=0 }
 END{ print c }
 AWK
 
-    # ---- ALT awk: reads supporting the translocation (variant allele) ----
-    # Passed via -v: PCHR (partner chr), PBP (partner breakpoint), W (window).
-    # A read is ALT if EITHER:
-    #   (a) split  : has SA:Z: tag whose target chr==PCHR & pos in [PBP-W,PBP+W]
-    #   (b) discord: RNEXT==PCHR & PNEXT in [PBP-W,PBP+W]  (mate at partner)
-    cat > count_alt.awk << 'AWK'
-function inwin(p){ return (p >= PBP-W && p <= PBP+W) }
-BEGIN{ c=0 }
-{
-  rnext=$7; pnext=$8; is_alt=0;
-  # (b) discordant mate pointing into the partner window
-  if(rnext==PCHR && inwin(pnext+0)) is_alt=1;
-  # (a) split read: parse SA tag if present
-  if(is_alt==0){
-    for(i=12;i<=NF;i++){
-      if($i ~ /^SA:Z:/){
-        sa=$i; sub(/^SA:Z:/,"",sa);
-        n=split(sa, arr, ";");
-        for(j=1;j<=n;j++){
-          if(length(arr[j])==0) continue;
-          m=split(arr[j], f, ",");
-          if(m>=2 && f[1]==PCHR && inwin(f[2]+0)){ is_alt=1; break }
-        }
-      }
-      if(is_alt==1) break;
-    }
-  }
-  # dedupe by read name: count each supporting molecule once, even if it
-  # appears as both a primary and a supplementary row at this locus.
-  if(is_alt==1 && !($1 in seen)){ seen[$1]=1; c++ }
-}
-END{ print c }
-AWK
-
-    # Output header. ALT = recounted at breakpoint (split + discordant mate).
-    # N_Molecules = original CatchTheFISH detection count, retained for compare.
-    printf 'ID\tChr_Cluster\tSIDE\tCHR\tBP\tPARTNER_CHR\tPARTNER_BP\tN_Molecules\tALT\tREF\tVAF\n' > "${id}_vaf.txt"
+    # Per-side table. ALT = N_Molecules (unique, detection-vetted molecule count
+    # from CatchTheFISH). REF = breakpoint-spanning reads at mapq>=minq.
+    # VAF = ALT / (ALT + REF) per side. IG side typically yields REF=0 at mapq 30
+    # (repetitive locus) -> VAF=NA, handled by the combine step below.
+    printf 'ID\tChr_Cluster\tSIDE\tCHR\tBP\tALT\tREF\tVAF\n' > "${id}_vaf_byside.txt"
 
     # Breakpoints columns: ID Chr_Cluster SIDE CHR BP PARTNER_CHR PARTNER_BP N_Molecules
     tail -n +2 "${bp}" | while IFS=$'\t' read -r BID CLUST SIDE CHR BP PCHR PBP NMOL; do
         [ -z "${BP:-}" ] && continue
-        [ -z "${PBP:-}" ] && continue
 
         region="${CHR}:${BP}-${BP}"
 
@@ -475,24 +440,63 @@ AWK
                 | awk -v BP=${BP} -f count_span.awk)
         REF=${REF:-0}
 
-        # ALT: split + discordant-mate reads at this breakpoint pointing at the
-        # PARTNER breakpoint window. We must NOT exclude supplementary (2048)
-        # alignments -- the supplementary half of a split read IS ALT evidence.
-        # -F 1292 excludes unmapped(4)+mate-unmapped(8)+secondary(256)+dup(1024)
-        # (1292 = 4+8+256+1024); keeps supplementary and non-proper-pair reads.
-        ALT=$(samtools view -F 1292 -q ${minq} \
-                -X ${bam} ${bai} "${region}" \
-                | awk -v PCHR=${PCHR} -v PBP=${PBP} -v W=${altwin} -f count_alt.awk)
-        ALT=${ALT:-0}
+        ALT=${NMOL:-0}
 
-        # VAF = ALT / (ALT + REF), symmetric counts at one stringency
+        # Per-side VAF = ALT / (ALT + REF). If denom is 0 -> NA.
         VAF=$(awk -v a="${ALT}" -v r="${REF}" 'BEGIN{ d=a+r; if(d>0) printf "%.6f", a/d; else print "NA" }')
 
-        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-            "${BID}" "${CLUST}" "${SIDE}" "${CHR}" "${BP}" "${PCHR}" "${PBP}" "${NMOL}" "${ALT}" "${REF}" "${VAF}" >> "${id}_vaf.txt"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "${BID}" "${CLUST}" "${SIDE}" "${CHR}" "${BP}" "${ALT}" "${REF}" "${VAF}" >> "${id}_vaf_byside.txt"
     done
+
+    # ---- Combine the two sides into one final VAF per cluster ----------------
+    # Rule:
+    #   * if exactly one side is NA -> use the other side
+    #   * if both real & same order of magnitude (floor(log10) equal) -> mean
+    #       (sides agree; averaging is a fair combined estimate)
+    #   * if both real & different order of magnitude -> bigger
+    #       (sides disagree; the smaller is likely coverage-deflated, e.g. the
+    #        IG bait inflating REF -> trust the larger, uncorrupted side)
+    #   * if both NA -> NA
+    cat > combine.awk << 'AWK'
+function oom(x){ return (x>0) ? int(log(x)/log(10) + ( (log(x)/log(10)<0 && (log(x)/log(10))!=int(log(x)/log(10))) ? -1 : 0)) : "NA" }
+BEGIN{ FS=OFS="\t" }
+NR==1 { next }   # skip header
+{
+  cl=$2;
+  side=$3; vaf=$8;
+  clust_id[cl]=$1"\t"cl;
+  if(side=="ONCO"){ onco[cl]=vaf }
+  else if(side=="IG"){ ig[cl]=vaf }
+}
+END{
+  print "ID","Chr_Cluster","VAF.ONCO","VAF.IG","VAF.FINAL","RULE";
+  for(cl in clust_id){
+    o=onco[cl]; g=ig[cl];
+    o_na = (o=="NA" || o=="");
+    g_na = (g=="NA" || g=="");
+    rule=""; final="NA";
+    if(o_na && g_na){ final="NA"; rule="both_NA" }
+    else if(o_na){ final=g; rule="IG_only" }
+    else if(g_na){ final=o; rule="ONCO_only" }
+    else {
+      # both real
+      oo=oom(o+0); og=oom(g+0);
+      if(oo==og){ final=(o+g)/2.0; rule="same_oom_mean" }
+      else { final=(o+0>=g+0)?o:g; rule="diff_oom_bigger" }
+    }
+    of = (o_na?"NA":sprintf("%.6f",o+0));
+    gf = (g_na?"NA":sprintf("%.6f",g+0));
+    ff = (final=="NA"?"NA":sprintf("%.6f",final+0));
+    print clust_id[cl], of, gf, ff, rule;
+  }
+}
+AWK
+
+    awk -f combine.awk "${id}_vaf_byside.txt" > "${id}_vaf.txt"
     """
     outputs = {
-        "vaf" : "*_vaf.txt"
+        "vaf" : "*_vaf.txt",
+        "vaf_byside" : "*_vaf_byside.txt"
     }
     docker = "jbalberge/samtools_cloud:1.13"
