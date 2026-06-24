@@ -467,8 +467,12 @@ AWK
 
         ALT=${NMOL:-0}
 
-        # Per-side VAF = ALT / (ALT + REF). If denom is 0 -> NA.
-        VAF=$(awk -v a="${ALT}" -v r="${REF}" 'BEGIN{ d=a+r; if(d>0) printf "%.6f", a/d; else print "NA" }')
+        # Per-side VAF = ALT / (ALT + REF).
+        # REF==0 means no reference coverage at this breakpoint (uncovered locus,
+        # e.g. an unbaited IG partner) -> VAF is undefined/unreliable -> NA,
+        # NOT 1.0. This stops a no-coverage side from spuriously winning the
+        # combine as VAF=1.0.
+        VAF=$(awk -v a="${ALT}" -v r="${REF}" 'BEGIN{ if(r+0<=0){ print "NA" } else { printf "%.6f", a/(a+r) } }')
 
         # bait membership for this breakpoint
         INB=$(awk -v QCHR="${CHR}" -v QBP="${BP}" -f bait_member.awk "${baitbed}")
