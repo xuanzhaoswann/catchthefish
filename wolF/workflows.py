@@ -17,6 +17,7 @@ def catchthefish(id,
                  eps=500,
                  minPts=2,
                  add_gs_suffix=False,
+                 bait_bed="gs://fc-15c5f539-a3ac-4ccd-8a9c-66bdd72cb5ff/parameters/combined_probes_Broad_Exome_hg19.bed",
                  workspace=None):
 
     bam_in_the_cloud = extract_sam(inputs={
@@ -47,7 +48,8 @@ def catchthefish(id,
         "id":id,
         "breakpoints":tx["breakpoints"],
         "gs_clean_bam":gs_clean_bam,
-        "gs_clean_bai":gs_clean_bai
+        "gs_clean_bai":gs_clean_bai,
+        "bait_bed":bait_bed
     })
 
     if workspace:

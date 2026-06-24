@@ -387,7 +387,9 @@ class count_ref(wolf.Task):
         "breakpoints":None,
         "gs_clean_bam":None,
         "gs_clean_bai":None,
-        "ref_min_mapq":30
+        "bait_bed":None,
+        "ref_min_mapq_onco":30,
+        "ref_min_mapq_ig":0
     }
     overrides = {"gs_clean_bam":"string", "gs_clean_bai":"string"}
     script = """
@@ -398,7 +400,9 @@ class count_ref(wolf.Task):
     bam="${gs_clean_bam}"
     bai="${gs_clean_bai}"
     bp="${breakpoints}"
-    minq="${ref_min_mapq}"
+    baitbed="${bait_bed}"
+    minq_onco="${ref_min_mapq_onco}"
+    minq_ig="${ref_min_mapq_ig}"
 
     # ---- REF awk: concordant reads that strongly span the breakpoint ----
     # Drops SA-tagged (split) reads; counts reads whose CIGAR-implied span
@@ -422,17 +426,38 @@ BEGIN{ c=0 }
 END{ print c }
 AWK
 
-    # Per-side table. ALT = N_Molecules (unique, detection-vetted molecule count
-    # from CatchTheFISH). REF = breakpoint-spanning reads at mapq>=minq.
-    # VAF = ALT / (ALT + REF) per side. IG side typically yields REF=0 at mapq 30
-    # (repetitive locus) -> VAF=NA, handled by the combine step below.
-    printf 'ID\tChr_Cluster\tSIDE\tCHR\tBP\tALT\tREF\tVAF\n' > "${id}_vaf_byside.txt"
+    # Per-side table. ALT = N_Molecules (unique, detection-vetted molecule count).
+    # REF = breakpoint-spanning reads, counted with a PER-SIDE mapq floor:
+    #   ONCO side -> minq_onco (strict, unique-mapping locus)
+    #   IG side   -> minq_ig   (loose, repetitive locus; matches detection mapq=0)
+    # IN_BAIT = whether this breakpoint falls in a bait/probe interval.
+    printf 'ID\tChr_Cluster\tSIDE\tCHR\tBP\tALT\tREF\tVAF\tIN_BAIT\n' > "${id}_vaf_byside.txt"
+
+    # --- bait membership helper (chr-normalized, skips browser/track header) ---
+    # Reads only the bait bed; query CHR/BP passed via -v; prints YES/NO in END.
+    cat > bait_member.awk << 'AWK'
+function norm(c){ sub(/^chr/,"",c); return c }
+{
+  if($1 ~ /^(browser|track)/) next;
+  if($2 !~ /^[0-9]+$/ || $3 !~ /^[0-9]+$/) next;
+  c=norm($1); n[c]++; s[c,n[c]]=$2+0; e[c,n[c]]=$3+0;
+}
+END{
+  chr=norm(QCHR); pos=QBP+0; inb="NO";
+  cnt=n[chr];
+  for(i=1;i<=cnt;i++){ if(pos>=s[chr,i] && pos<=e[chr,i]){ inb="YES"; break } }
+  print inb;
+}
+AWK
 
     # Breakpoints columns: ID Chr_Cluster SIDE CHR BP PARTNER_CHR PARTNER_BP N_Molecules
     tail -n +2 "${bp}" | while IFS=$'\t' read -r BID CLUST SIDE CHR BP PCHR PBP NMOL; do
         [ -z "${BP:-}" ] && continue
 
         region="${CHR}:${BP}-${BP}"
+
+        # per-side mapq floor
+        if [ "${SIDE}" = "ONCO" ]; then minq=${minq_onco}; else minq=${minq_ig}; fi
 
         # REF: clean spanning reads at this breakpoint, mapq >= minq
         REF=$(samtools view -f 2 -F 3852 -q ${minq} \
@@ -445,50 +470,62 @@ AWK
         # Per-side VAF = ALT / (ALT + REF). If denom is 0 -> NA.
         VAF=$(awk -v a="${ALT}" -v r="${REF}" 'BEGIN{ d=a+r; if(d>0) printf "%.6f", a/d; else print "NA" }')
 
-        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-            "${BID}" "${CLUST}" "${SIDE}" "${CHR}" "${BP}" "${ALT}" "${REF}" "${VAF}" >> "${id}_vaf_byside.txt"
+        # bait membership for this breakpoint
+        INB=$(awk -v QCHR="${CHR}" -v QBP="${BP}" -f bait_member.awk "${baitbed}")
+        INB=${INB:-NO}
+
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "${BID}" "${CLUST}" "${SIDE}" "${CHR}" "${BP}" "${ALT}" "${REF}" "${VAF}" "${INB}" >> "${id}_vaf_byside.txt"
     done
 
     # ---- Combine the two sides into one final VAF per cluster ----------------
-    # Rule:
-    #   * if exactly one side is NA -> use the other side
-    #   * if both real & same order of magnitude (floor(log10) equal) -> mean
-    #       (sides agree; averaging is a fair combined estimate)
-    #   * if both real & different order of magnitude -> bigger
-    #       (sides disagree; the smaller is likely coverage-deflated, e.g. the
-    #        IG bait inflating REF -> trust the larger, uncorrupted side)
-    #   * if both NA -> NA
+    # Precedence:
+    #   1. Bait membership (we trust high-coverage baited breakpoints):
+    #        both sides in bait    -> mean(VAF.ONCO, VAF.IG)
+    #        exactly one in bait   -> use that side's VAF
+    #   2. Neither side in bait    -> fall back to order-of-magnitude rule:
+    #        both real & same OOM  -> mean
+    #        both real & diff OOM  -> bigger
+    #   NA handling underlies all: a NA side can't be used; if the chosen side
+    #   is NA, fall through to the other side / OOM as appropriate.
     cat > combine.awk << 'AWK'
 function oom(x){ return (x>0) ? int(log(x)/log(10) + ( (log(x)/log(10)<0 && (log(x)/log(10))!=int(log(x)/log(10))) ? -1 : 0)) : "NA" }
 BEGIN{ FS=OFS="\t" }
 NR==1 { next }   # skip header
 {
-  cl=$2;
-  side=$3; vaf=$8;
+  cl=$2; side=$3; vaf=$8; inb=$9;
   clust_id[cl]=$1"\t"cl;
-  if(side=="ONCO"){ onco[cl]=vaf }
-  else if(side=="IG"){ ig[cl]=vaf }
+  if(side=="ONCO"){ onco[cl]=vaf; onco_b[cl]=inb }
+  else if(side=="IG"){ ig[cl]=vaf; ig_b[cl]=inb }
 }
 END{
-  print "ID","Chr_Cluster","VAF.ONCO","VAF.IG","VAF.FINAL","RULE";
+  print "ID","Chr_Cluster","VAF.ONCO","VAF.IG","ONCO_IN_BAIT","IG_IN_BAIT","VAF.FINAL","RULE";
   for(cl in clust_id){
     o=onco[cl]; g=ig[cl];
-    o_na = (o=="NA" || o=="");
-    g_na = (g=="NA" || g=="");
+    ob=onco_b[cl]; gb=ig_b[cl];
+    o_na=(o=="NA"||o==""); g_na=(g=="NA"||g=="");
+    o_ok=(!o_na); g_ok=(!g_na);
+    obait=(ob=="YES"); gbait=(gb=="YES");
     rule=""; final="NA";
-    if(o_na && g_na){ final="NA"; rule="both_NA" }
-    else if(o_na){ final=g; rule="IG_only" }
-    else if(g_na){ final=o; rule="ONCO_only" }
-    else {
-      # both real
+
+    # 1. bait-based decision, but only trust a baited side if it's non-NA
+    if(obait && gbait && o_ok && g_ok){ final=(o+g)/2.0; rule="both_bait_mean" }
+    else if(obait && o_ok && !(gbait && g_ok)){ final=o; rule="onco_bait_only" }
+    else if(gbait && g_ok && !(obait && o_ok)){ final=g; rule="ig_bait_only" }
+    # 2. neither side usable via bait -> OOM fallback on whatever real values exist
+    else if(o_ok && g_ok){
       oo=oom(o+0); og=oom(g+0);
-      if(oo==og){ final=(o+g)/2.0; rule="same_oom_mean" }
-      else { final=(o+0>=g+0)?o:g; rule="diff_oom_bigger" }
+      if(oo==og){ final=(o+g)/2.0; rule="fallback_same_oom_mean" }
+      else { final=(o+0>=g+0)?o:g; rule="fallback_diff_oom_bigger" }
     }
-    of = (o_na?"NA":sprintf("%.6f",o+0));
-    gf = (g_na?"NA":sprintf("%.6f",g+0));
-    ff = (final=="NA"?"NA":sprintf("%.6f",final+0));
-    print clust_id[cl], of, gf, ff, rule;
+    else if(o_ok){ final=o; rule="onco_only" }
+    else if(g_ok){ final=g; rule="ig_only" }
+    else { final="NA"; rule="both_NA" }
+
+    of=(o_na?"NA":sprintf("%.6f",o+0));
+    gf=(g_na?"NA":sprintf("%.6f",g+0));
+    ff=(final=="NA"?"NA":sprintf("%.6f",final+0));
+    print clust_id[cl], of, gf, ob, gb, ff, rule;
   }
 }
 AWK
