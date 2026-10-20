@@ -18,7 +18,8 @@ def catchthefish(id,
                  minPts=2,
                  add_gs_suffix=False,
                  bait_bed="gs://fc-15c5f539-a3ac-4ccd-8a9c-66bdd72cb5ff/parameters/combined_probes_Broad_Exome_hg19.bed",
-                 workspace=None):
+                 workspace=None,
+                 workspace_entity_type="pair"):
 
     bam_in_the_cloud = extract_sam(inputs={
                                         "id":id,
@@ -63,8 +64,7 @@ def catchthefish(id,
                 }
         sync_run = SyncToWorkspace(
                 nameworkspace = workspace,
-                #entity_type = "pair",
-                entity_type = "sample",
+                entity_type = workspace_entity_type,
                 entity_name = id,
                 attr_map = upload_dict
                 )
