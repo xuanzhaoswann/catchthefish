@@ -125,6 +125,7 @@ cluster.tx <- function(tx, eps=2E5, minPts=3, min_noise_partner=1000, min_ig_par
   tx %>%
     group_by(IG_CHR, PARTNER_CHR) %>%
     group_modify(~ { 
+      if (nrow(.x) < 2) return(.x %>% mutate(Cluster = 0L));
       distances <-  dist(matrix(c(.x$PARTNER_POS, .x$IG_POS), ncol=2, byrow = FALSE), method = "maximum");
       .x %>% mutate(Cluster = dbscan(distances, eps=eps, minPts=minPts)$cluster)}) %>%
     mutate(Chr_Cluster=paste0(IG_CHR, "-", PARTNER_CHR, "_", Cluster)) %>% 

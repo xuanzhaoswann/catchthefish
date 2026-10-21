@@ -259,6 +259,7 @@ if( nrow(tx ) < 2 ) {
   res1 <- tx.join.annot %>%
     group_by(ID, ONCO, IG) %>%
     group_modify(~ {
+      if (nrow(.x) < 2) return(.x %>% mutate(Cluster = 0L));
       distances <-  dist(matrix(c(.x$POS.IG, .x$POS.ONCO), ncol=2, byrow = FALSE), method = "maximum");
       .x %>% mutate(Cluster = dbscan(distances, eps=eps, minPts=minPts)$cluster)}) %>%
     mutate(Chr_Cluster=paste0(IG, "-", ONCO, "_", Cluster)) %>%
