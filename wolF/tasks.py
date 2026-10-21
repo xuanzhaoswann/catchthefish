@@ -212,6 +212,7 @@ tx <- read.delim(reads, col.names = tx.header, colClasses = tx.col.classes, head
 if( nrow(tx ) < 2 ) {
   res.colnames <- c("ID","Chr_Cluster","IG","ONCO","CHR.IG","IG_START","IG_END","CHR.ONCO","PARTNER_START","PARTNER_END","INTERVAL_LENGTH","IG_LENGTH","reads","maxMAPQ.ONCO","maxMAPQ.IG","N_Matches","N_Molecules","N_Mate_Pairs","N_Split_Reads","Breakpoint","BP.ONCO","BP.IG","BP_PRECISE","ALT")
   res <- setNames(data.frame(matrix(ncol = length(res.colnames), nrow = 0)), res.colnames)
+  res1 <- res
   pdf(circos.plot, paper = "a4")
   circos.clear()
   circos.par("track.height" = 0.1, start.degree = 90)
